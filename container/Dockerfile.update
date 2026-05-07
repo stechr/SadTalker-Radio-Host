@@ -1,0 +1,5 @@
+ARG ECR_IMAGE
+FROM ${ECR_IMAGE}
+
+# Replace serve.py with updated version
+COPY serve.py /opt/sadtalker/serve.py

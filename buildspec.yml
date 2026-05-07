@@ -1,0 +1,26 @@
+version: 0.2
+
+env:
+  variables:
+    REPO_NAME: sadtalker-inference
+    IMAGE_TAG: latest
+
+phases:
+  pre_build:
+    commands:
+      - echo Detecting account and region...
+      - ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+      - AWS_DEFAULT_REGION=$(aws configure get region || echo $AWS_DEFAULT_REGION)
+      - FULL_IMAGE="${ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/${REPO_NAME}:${IMAGE_TAG}"
+      - echo "Image URI: ${FULL_IMAGE}"
+      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+  build:
+    commands:
+      - echo Building Docker image...
+      - docker build --platform linux/amd64 -t $REPO_NAME:$IMAGE_TAG .
+      - docker tag $REPO_NAME:$IMAGE_TAG $FULL_IMAGE
+  post_build:
+    commands:
+      - echo Pushing to ECR...
+      - docker push $FULL_IMAGE
+      - echo Build complete.
