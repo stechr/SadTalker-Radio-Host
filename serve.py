@@ -21,6 +21,9 @@ logger = logging.getLogger(__name__)
 s3 = boto3.client("s3")
 SADTALKER_DIR = "/opt/sadtalker"
 CHECKPOINT_DIR = os.path.join(SADTALKER_DIR, "checkpoints")
+WAV2LIP_DIR = "/opt/wav2lip"
+WAV2LIP_CKPT = os.path.join(WAV2LIP_DIR, "checkpoints", "wav2lip_gan.pth")
+WAV2LIP_AVAILABLE = os.path.isdir(WAV2LIP_DIR) and os.path.isfile(WAV2LIP_CKPT)
 
 # Valid parameter values
 VALID_ENHANCERS = {"gfpgan", "RestoreFormer", "none"}
@@ -66,6 +69,9 @@ def invoke() -> tuple[Response, int]:
     still_mode = payload.get("still_mode", True)
     expression_scale = float(payload.get("expression_scale", 1.0))
     pose_style = int(payload.get("pose_style", 0))
+    lip_sync = bool(payload.get("lip_sync", WAV2LIP_AVAILABLE))
+    if lip_sync and not WAV2LIP_AVAILABLE:
+        return jsonify({"error": "lip_sync requested but Wav2Lip is not installed in this image"}), 400
 
     if not (0.0 <= expression_scale <= 3.0):
         return jsonify({"error": "expression_scale must be between 0.0 and 3.0"}), 400
@@ -111,8 +117,13 @@ def invoke() -> tuple[Response, int]:
         # Run SadTalker
         proc = subprocess.run(cmd, cwd=SADTALKER_DIR, capture_output=True, text=True, timeout=600)
         if proc.returncode != 0:
-            logger.error("SadTalker failed: %s", proc.stderr[-2000:])
-            return jsonify({"error": f"Inference failed: {proc.stderr[-500:]}"}), 500
+            logger.error("SadTalker failed. stderr: %s\nstdout: %s", proc.stderr, proc.stdout)
+            return jsonify({
+                "error": "SadTalker failed",
+                "stderr": proc.stderr,
+                "stdout": proc.stdout,
+                "returncode": proc.returncode,
+            }), 500
 
         # Find output video
         mp4_files = []
@@ -123,10 +134,42 @@ def invoke() -> tuple[Response, int]:
             logger.error("No output video found. stdout: %s", proc.stdout[-1000:])
             return jsonify({"error": "No output video generated"}), 500
 
+        # Pick the most-recently-modified mp4 (SadTalker may emit an intermediate file).
+        sadtalker_video = max(mp4_files, key=os.path.getmtime)
+        final_video = sadtalker_video
+
+        # Optionally refine lip sync with Wav2Lip.
+        if lip_sync:
+            refined = os.path.join(tmp, "refined.mp4")
+            w2l_cmd = [
+                "python", "inference.py",
+                "--checkpoint_path", WAV2LIP_CKPT,
+                "--face", sadtalker_video,
+                "--audio", aud_path,
+                "--outfile", refined,
+                "--pads", "0", "20", "0", "0",
+                "--resize_factor", "1",
+                "--nosmooth",
+            ]
+            logger.info("Running Wav2Lip refinement...")
+            w2l_proc = subprocess.run(
+                w2l_cmd, cwd=WAV2LIP_DIR, capture_output=True, text=True, timeout=600,
+            )
+            if w2l_proc.returncode != 0 or not os.path.isfile(refined):
+                logger.error("Wav2Lip failed. stderr: %s\nstdout: %s",
+                             w2l_proc.stderr, w2l_proc.stdout)
+                return jsonify({
+                    "error": "Wav2Lip failed",
+                    "stderr": w2l_proc.stderr,
+                    "stdout": w2l_proc.stdout,
+                    "returncode": w2l_proc.returncode,
+                }), 500
+            final_video = refined
+
         # Upload result to S3
         try:
             bucket, key = parse_s3_uri(payload["output_s3_uri"])
-            s3.upload_file(mp4_files[0], bucket, key, ExtraArgs={"ContentType": "video/mp4"})
+            s3.upload_file(final_video, bucket, key, ExtraArgs={"ContentType": "video/mp4"})
         except Exception as e:
             logger.error("Failed to upload result: %s", e)
             return jsonify({"error": f"Failed to upload result: {e}"}), 500

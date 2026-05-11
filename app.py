@@ -5,7 +5,9 @@ async inference, poll for results, and play/download the output video.
 """
 
 import json
+import logging
 import os
+import threading
 import uuid
 
 import boto3
@@ -16,19 +18,26 @@ app = Flask(__name__)
 # --- Configuration -----------------------------------------------------------
 
 _session = boto3.Session()
-REGION = os.environ.get("AWS_REGION", _session.region_name or "us-east-1")
+REGION = os.environ.get("AWS_REGION", _session.region_name or "eu-north-1")
 ACCOUNT_ID = boto3.client("sts", region_name=REGION).get_caller_identity()["Account"]
-BUCKET = f"sadtalker-demo-{ACCOUNT_ID}"
-ENDPOINT = "sadtalker-async"
+BUCKET = os.environ.get("S3_BUCKET", f"sadtalker-demo-{ACCOUNT_ID}")
+ENDPOINT = os.environ.get("ENDPOINT_NAME", "sadtalker-async")
 
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-RESULTS_DIR = os.path.join(_BASE_DIR, "..", "results")
-CONFIG_FILE = os.path.join(_BASE_DIR, "..", "config.json")
+RESULTS_DIR = os.environ.get("RESULTS_DIR", os.path.join(_BASE_DIR, "results"))
+CONFIG_FILE = os.environ.get("CONFIG_FILE", os.path.join(_BASE_DIR, "config.json"))
 
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
+
 s3 = boto3.client("s3", region_name=REGION)
 sm_runtime = boto3.client("sagemaker-runtime", region_name=REGION)
+
+# Job state: job_id -> {"status": str, "error": str | None}
+_jobs: dict[str, dict] = {}
+_jobs_lock = threading.Lock()
 
 DEFAULT_CONFIG = {
     "enhancer": "gfpgan",
@@ -36,6 +45,7 @@ DEFAULT_CONFIG = {
     "preprocess": "crop",
     "expression_scale": 1.0,
     "pose_style": 0,
+    "lip_sync": True,
 }
 
 
@@ -55,16 +65,57 @@ def save_config(cfg: dict) -> None:
         json.dump(cfg, f, indent=2)
 
 
-def _upload_payload(job_id: str, payload: str) -> str:
-    """Upload JSON payload to S3 and return its URI for async invocation."""
-    key = f"async-input/{job_id}.json"
-    s3.put_object(Bucket=BUCKET, Key=key, Body=payload, ContentType="application/json")
-    return f"s3://{BUCKET}/{key}"
-
-
 def _get_local_path(job_id: str) -> str:
     """Return local file path for a job's result video."""
     return os.path.join(RESULTS_DIR, f"{job_id}.mp4")
+
+
+def _set_job(job_id: str, status: str, error: str | None = None) -> None:
+    with _jobs_lock:
+        _jobs[job_id] = {"status": status, "error": error}
+
+
+def _run_inference(job_id: str, payload: dict) -> None:
+    """Trigger SageMaker async inference; update job state."""
+    _set_job(job_id, "Processing (GPU inference)...")
+    try:
+        payload_key = f"async-input/{job_id}.json"
+        s3.put_object(Bucket=BUCKET, Key=payload_key, Body=json.dumps(payload), ContentType="application/json")
+        resp = sm_runtime.invoke_endpoint_async(
+            EndpointName=ENDPOINT,
+            ContentType="application/json",
+            InputLocation=f"s3://{BUCKET}/{payload_key}",
+        )
+        inference_id = resp.get("InferenceId", "")
+    except Exception as e:
+        _set_job(job_id, "error", f"Inference request failed: {e}")
+        return
+
+    # Poll S3 for result, also check for failure via SageMaker API
+    import time
+    out_key = f"output/{job_id}/result.mp4"
+    err_key = f"output/{job_id}/error.json"
+    local_path = _get_local_path(job_id)
+    for i in range(60):  # up to 5 min (5s × 60)
+        time.sleep(5)
+        # Check for success
+        try:
+            s3.head_object(Bucket=BUCKET, Key=out_key)
+            s3.download_file(BUCKET, out_key, local_path)
+            _set_job(job_id, "done")
+            return
+        except s3.exceptions.ClientError:
+            pass
+        # Check for error marker written by serve.py
+        try:
+            err_obj = s3.get_object(Bucket=BUCKET, Key=err_key)
+            err_body = json.loads(err_obj["Body"].read())
+            _set_job(job_id, "error", err_body.get("error", "Inference failed (unknown reason)"))
+            return
+        except s3.exceptions.ClientError:
+            pass
+
+    _set_job(job_id, "error", "Inference timed out after 5 minutes")
 
 
 # --- HTML Template -----------------------------------------------------------
@@ -86,7 +137,9 @@ button { background: #ff9900; border: none; padding: 12px 24px; color: #000;
          font-weight: bold; border-radius: 4px; cursor: pointer; font-size: 16px; }
 button:disabled { opacity: 0.5; cursor: not-allowed; }
 .btn-secondary { background: #232f3e; color: #fff; padding: 8px 16px; font-size: 14px; }
-#status { margin: 20px 0; padding: 15px; background: #f0f0f0; border-radius: 4px; display: none; }
+#status { margin: 20px 0; padding: 15px; background: #f0f0f0; border-radius: 4px; display: none;
+          white-space: pre-wrap; word-break: break-word; font-family: ui-monospace, monospace;
+          font-size: 12px; max-height: 400px; overflow: auto; }
 video { width: 100%; max-width: 640px; margin-top: 20px; border-radius: 8px; }
 .spinner { display: inline-block; width: 16px; height: 16px; border: 2px solid #ccc;
            border-top-color: #ff9900; border-radius: 50%; animation: spin 1s linear infinite; }
@@ -148,6 +201,15 @@ video { width: 100%; max-width: 640px; margin-top: 20px; border-radius: 8px; }
     <span class="desc">Selects a pre-defined head pose trajectory. 0 = default.
       Each number produces a different combination of head tilts and turns.</span>
   </div>
+  <div class="setting-row">
+    <label for="lip_sync">Wav2Lip Refinement:</label>
+    <select id="lip_sync">
+      <option value="true">On (sharper lip sync, +30-60s)</option>
+      <option value="false">Off (SadTalker only, faster)</option>
+    </select>
+    <span class="desc">Chains Wav2Lip after SadTalker to replace the mouth region with phoneme-accurate lip movement.
+      Big quality win on real faces; slight extra time per request.</span>
+  </div>
   <button class="btn-secondary" onclick="saveSettings()">Save Settings</button>
   <button class="btn-secondary" onclick="resetSettings()" style="background:#666">Reset Defaults</button>
   <span id="save-confirm" style="color:green; margin-left:10px; display:none">&#10003; Saved</span>
@@ -171,6 +233,7 @@ fetch('/api/config').then(r => r.json()).then(cfg => {
   document.getElementById('expression_scale').value = cfg.expression_scale || 1.0;
   document.getElementById('expression_val').textContent = cfg.expression_scale || 1.0;
   document.getElementById('pose_style').value = cfg.pose_style || 0;
+  document.getElementById('lip_sync').value = String(cfg.lip_sync !== false);
 });
 
 document.getElementById('expression_scale').oninput = function() {
@@ -184,6 +247,7 @@ function getSettings() {
     preprocess: document.getElementById('preprocess').value,
     expression_scale: parseFloat(document.getElementById('expression_scale').value),
     pose_style: parseInt(document.getElementById('pose_style').value, 10),
+    lip_sync: document.getElementById('lip_sync').value === 'true',
   };
 }
 
@@ -207,6 +271,7 @@ function resetSettings() {
     document.getElementById('expression_scale').value = cfg.expression_scale;
     document.getElementById('expression_val').textContent = cfg.expression_scale;
     document.getElementById('pose_style').value = cfg.pose_style;
+    document.getElementById('lip_sync').value = String(cfg.lip_sync !== false);
     const c = document.getElementById('save-confirm');
     c.textContent = '\\u2713 Reset';
     c.style.display = 'inline';
@@ -331,7 +396,7 @@ def invoke() -> Response:
     except Exception as e:
         return jsonify({"error": f"Upload failed: {e}"}), 500
 
-    payload = json.dumps({
+    payload = {
         "image_s3_uri": f"s3://{BUCKET}/{img_key}",
         "audio_s3_uri": f"s3://{BUCKET}/{aud_key}",
         "output_s3_uri": f"s3://{BUCKET}/{out_key}",
@@ -340,36 +405,26 @@ def invoke() -> Response:
         "preprocess": cfg.get("preprocess", "crop"),
         "expression_scale": cfg.get("expression_scale", 1.0),
         "pose_style": cfg.get("pose_style", 0),
-    })
+        "lip_sync": cfg.get("lip_sync", True),
+    }
 
-    try:
-        resp = sm_runtime.invoke_endpoint_async(
-            EndpointName=ENDPOINT,
-            ContentType="application/json",
-            InputLocation=_upload_payload(job_id, payload),
-        )
-    except Exception as e:
-        return jsonify({"error": f"Failed to invoke endpoint: {e}"}), 500
+    _set_job(job_id, "Uploading to inference...")
+    threading.Thread(target=_run_inference, args=(job_id, payload), daemon=True).start()
 
-    return jsonify({"job_id": job_id, "inference_id": resp.get("InferenceId")})
+    return jsonify({"job_id": job_id})
 
 
 @app.route("/api/status/<job_id>")
 def status(job_id: str) -> Response:
-    """Poll for job completion by checking if output exists in S3."""
+    """Poll for job completion using in-memory job state."""
     if not _is_valid_job_id(job_id):
         return jsonify({"error": "Invalid job ID"}), 400
 
-    out_key = f"output/{job_id}/result.mp4"
-    try:
-        s3.head_object(Bucket=BUCKET, Key=out_key)
-        # Auto-download to local results folder
-        local_path = _get_local_path(job_id)
-        if not os.path.exists(local_path):
-            s3.download_file(BUCKET, out_key, local_path)
-        return jsonify({"status": "done"})
-    except s3.exceptions.ClientError:
-        return jsonify({"status": "Processing (waiting for GPU inference)..."})
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+    if not job:
+        return jsonify({"status": "error", "error": "Unknown job"}), 404
+    return jsonify(job)
 
 
 @app.route("/api/video/<job_id>")
@@ -416,8 +471,10 @@ def _is_valid_job_id(job_id: str) -> bool:
 # --- Entry point -------------------------------------------------------------
 
 if __name__ == "__main__":
-    print(f"\n🎙️  SadTalker Demo UI")
-    print(f"   Open http://localhost:5000 in your browser")
-    print(f"   Results saved to: {os.path.abspath(RESULTS_DIR)}")
-    print(f"   Bucket: {BUCKET} ({REGION})\n")
-    app.run(host="127.0.0.1", port=5000, debug=True)
+    host = os.environ.get("HOST", "127.0.0.1")
+    port = int(os.environ.get("PORT", "5000"))
+    debug = os.environ.get("FLASK_DEBUG", "1") == "1"
+    logger.info("SadTalker Demo UI on http://%s:%d", host, port)
+    logger.info("Endpoint: %s", ENDPOINT)
+    logger.info("Bucket: %s (%s)", BUCKET, REGION)
+    app.run(host=host, port=port, debug=debug)
